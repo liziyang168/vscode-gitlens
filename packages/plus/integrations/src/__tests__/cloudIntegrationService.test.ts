@@ -22,6 +22,29 @@ function createCloudService(responder: (path: string, init?: RequestInit) => unk
 	return { service: new CloudIntegrationService(runtime), calls: calls };
 }
 
+/** Wires a fake `fetchGkApi` that returns a fixed non-ok status for every call (failure-path tests). */
+function createFailingCloudService(status: number) {
+	const runtime = createFakeRuntime();
+	runtime.account.fetchGkApi = () =>
+		Promise.resolve(new Response(JSON.stringify({ error: 'boom' }), { status: status }));
+	return new CloudIntegrationService(runtime);
+}
+
+/**
+ * Wires a fake `fetchGkApi` that fails with a different non-ok status per call, in call order, and records
+ * the paths. Drives the refresh fallback: call 1 is the `/refresh` POST, call 2 the plain GET retry.
+ */
+function createSequentiallyFailingCloudService(...statuses: number[]) {
+	const runtime = createFakeRuntime();
+	const paths: string[] = [];
+	runtime.account.fetchGkApi = (path: string) => {
+		paths.push(path);
+		const status = statuses[paths.length - 1] ?? statuses.at(-1);
+		return Promise.resolve(new Response(JSON.stringify({ error: 'boom' }), { status: status }));
+	};
+	return { service: new CloudIntegrationService(runtime), paths: paths };
+}
+
 suite('CloudIntegrationService — multi-account wire mapping (#5430)', () => {
 	test('getConnections flattens primary + secondaries and maps tokenId/positional primary', async () => {
 		const { service } = createCloudService(() => ({
@@ -190,5 +213,62 @@ suite('CloudIntegrationService — multi-account wire mapping (#5430)', () => {
 		assert.equal(ok, true);
 		assert.equal(calls[0].path, 'v1/provider-tokens/tokens/secondary-tok');
 		assert.equal(calls[0].method, 'DELETE');
+	});
+});
+
+suite('CloudIntegrationService — transient vs terminal failure classification (#5569)', () => {
+	test('getConnectionSession throws on a transient 5xx failure so callers can retry', async () => {
+		const service = createFailingCloudService(503);
+
+		await assert.rejects(
+			service.getConnectionSession(GitCloudHostIntegrationId.GitHub),
+			'a 5xx failure is retryable and must not be reported as a definitive empty result',
+		);
+	});
+
+	test('getConnectionSession throws on a 429 rate-limit failure', async () => {
+		const service = createFailingCloudService(429);
+
+		await assert.rejects(service.getConnectionSession(GitCloudHostIntegrationId.GitHub));
+	});
+
+	test('getConnectionSession returns undefined on a terminal 4xx failure so the connection can be dropped', async () => {
+		const service = createFailingCloudService(404);
+
+		assert.equal(await service.getConnectionSession(GitCloudHostIntegrationId.GitHub), undefined);
+	});
+
+	test('getConnectionSession returns undefined on an ok-but-empty response (the connection has no token)', async () => {
+		const { service } = createCloudService(() => ({ data: null }));
+
+		assert.equal(await service.getConnectionSession(GitCloudHostIntegrationId.GitHub), undefined);
+	});
+
+	test('a failed refresh whose fallback GET fails transiently throws (classified by the fallback)', async () => {
+		// The refresh POST fails terminally, but the fallback GET — the request that actually decides whether
+		// the token is still fetchable — fails transiently, so the failure must surface as retryable.
+		const { service, paths } = createSequentiallyFailingCloudService(400, 503);
+
+		await assert.rejects(
+			service.getConnectionSession(GitCloudHostIntegrationId.GitHub, 'stale-access-token'),
+			/Transient failure \(503\)/,
+		);
+		assert.deepEqual(
+			paths,
+			['v1/provider-tokens/github/refresh', 'v1/provider-tokens/github'],
+			'a failed refresh falls back to a plain GET before the failure is classified',
+		);
+	});
+
+	test('a failed refresh whose fallback GET fails terminally returns undefined, even if the refresh was transient', async () => {
+		// The reverse pairing: the refresh POST fails transiently, but the fallback GET answers definitively
+		// that the token is gone. The fallback is authoritative, so this is terminal (droppable), not retryable.
+		const { service, paths } = createSequentiallyFailingCloudService(503, 404);
+
+		assert.equal(
+			await service.getConnectionSession(GitCloudHostIntegrationId.GitHub, 'stale-access-token'),
+			undefined,
+		);
+		assert.deepEqual(paths, ['v1/provider-tokens/github/refresh', 'v1/provider-tokens/github']);
 	});
 });

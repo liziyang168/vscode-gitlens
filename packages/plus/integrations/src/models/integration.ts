@@ -331,6 +331,7 @@ export abstract class IntegrationBase<
 	private skippedNonCloudReported = false;
 	@debug()
 	async syncCloudConnection(state: 'connected' | 'disconnected', forceSync: boolean): Promise<void> {
+		const scope = getScopedLogger();
 		// Initially the condition on `this._session.cloud` has been added here: https://github.com/gitkraken/vscode-gitlens/commit/e95e70c430bd162924cc3bd5c1e8ab90e6293449#diff-4213141a45cccaab7aa2e40028b155a87eb913b07388485831403e60ce5555e4R237
 		// I'm not sure about reasons, but it seems we want to replace it with the cloud session if it's connected.
 		// Gradually we'll stop having non-cloud sessions.
@@ -374,17 +375,28 @@ export abstract class IntegrationBase<
 
 				// sync option, rather than createIfNeeded, makes sure we don't call connectCloudIntegrations and open a gkdev window
 				// if there was no session or some problem fetching/refreshing the existing session from the cloud api
-				const newSession = await this.ensureSession({ sync: forceSync });
+				let newSession: ProviderAuthenticationSession | undefined;
+				let refetchFailed = false;
+				try {
+					newSession = await this.ensureSession({ sync: forceSync });
+				} catch (ex) {
+					// A thrown failure means the backend was unreachable or returned a transient/retryable error
+					// (5xx/429). We can't conclude the connection is gone, so preserve the descriptor and let it
+					// self-heal on the next successful sync rather than disconnecting a healthy integration (#5569).
+					scope?.error(ex);
+					refetchFailed = true;
+				}
 
 				if (oldSession && newSession && newSession.accessToken !== oldSession.accessToken) {
 					this.resetRequestExceptionCount('all');
 				}
 
 				// The forced re-sync above deleted the cloud secret but preserved the descriptor to avoid UI
-				// churn while a fresh token is fetched. If that fetch failed, drop the now token-less descriptor
-				// so the connection isn't reported connected without a backing token (matches the pre-multi-account
-				// clean-disconnect-on-failure behavior). The success path leaves the descriptor untouched.
-				if (resyncing && newSession == null) {
+				// churn while a fresh token is fetched. Drop the now token-less descriptor ONLY when the
+				// replacement fetch came back definitively empty (a terminal 4xx / no-token response) — not when
+				// it failed transiently (#5569) — so a legacy connection whose token can no longer be fetched is
+				// still cleanly disconnected (#5497), while a healthy one survives a momentary backend error.
+				if (resyncing && newSession == null && !refetchFailed) {
 					const authProvider = await this.authenticationService.get(this.authProvider.id);
 					await authProvider.deleteSession(this.authProviderDescriptor, { preserveConfigured: false });
 				}
@@ -512,6 +524,11 @@ export abstract class IntegrationBase<
 			if (ex instanceof Error && ex.message.includes('User did not consent')) {
 				return undefined;
 			}
+
+			// On a forced re-sync, propagate the failure so syncCloudConnection can tell an unreachable or
+			// transient backend (keep the descriptor, self-heal) from a definitive empty result (drop it)
+			// (#5569). Other callers keep the swallow-to-null behavior so reads never throw.
+			if (sync) throw ex;
 
 			session = null;
 		}

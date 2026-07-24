@@ -27,14 +27,12 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/) and this p
 - Fixes the _Commit Graph_ working changes (WIP) details continuing to show files after they were committed or discarded outside of VS Code (e.g. from a terminal)
 - Fixes the _Commit Graph_ view's progress indicator repeatedly flashing while nothing appears to change (most noticeable after the VS Code window regains focus) &mdash; last-fetched updates now coalesce into a single pending update instead of queuing one per `FETCH_HEAD` change
 - Fixes the _Commit Graph_ sidebar list hovers repeatedly opening and closing in narrow viewports &mdash; when there's no room beside the list the hover now falls back below/above the row instead of flipping over the pointer, and moving the pointer into the hover keeps it open (like VS Code's own tree hovers) instead of dismissing it
+- Fixes self-managed cloud integrations (e.g. GitHub Enterprise, GitLab Self-Hosted) repeatedly issuing a token request that the server rejects on every session refresh, and legacy connections getting stuck reported as connected with no usable token &mdash; the per-connection token fetch no longer uses the host domain as the token id, and a connection whose token can no longer be fetched is now cleanly disconnected instead of left token-less ([#5497](https://github.com/gitkraken/vscode-gitlens/issues/5497))
+- Fixes a healthy cloud integration (e.g. GitLab.com, Jira, Azure DevOps, Bitbucket Cloud) being fully disconnected when a transient backend error (a 5xx or 429 response) happens to land during an automatic session-expiry refresh &mdash; a transient/retryable token-fetch failure now preserves the connection so it self-heals on the next successful sync, while a terminal failure (the token is genuinely gone) still cleanly disconnects ([#5569](https://github.com/gitkraken/vscode-gitlens/issues/5569))
 
 ### Removed
 
 - Removes the _Pro_ feature badge from the _Commit Graph_ header &mdash; the _Start New_ menu now occupies that area ([#5447](https://github.com/gitkraken/vscode-gitlens/issues/5447))
-
-### Fixed
-
-- Fixes self-managed cloud integrations (e.g. GitHub Enterprise, GitLab Self-Hosted) repeatedly issuing a token request that the server rejects on every session refresh, and legacy connections getting stuck reported as connected with no usable token &mdash; the per-connection token fetch no longer uses the host domain as the token id, and a connection whose token can no longer be fetched is now cleanly disconnected instead of left token-less ([#5497](https://github.com/gitkraken/vscode-gitlens/issues/5497))
 
 ## [18.3.0] - 2026-07-09
 

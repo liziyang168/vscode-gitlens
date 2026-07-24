@@ -34,6 +34,16 @@ interface GKProviderToken {
 	domain?: string;
 }
 
+/**
+ * Whether a non-ok GK backend response is retryable (transient) rather than terminal. 5xx server errors
+ * and 429 rate-limits are transient; other 4xx responses (unauthorized/forbidden/not-found/bad-request)
+ * mean the connection/token is really gone. Callers use this to preserve a connection through a momentary
+ * backend blip (#5569) instead of disconnecting it, while still cleanly dropping a genuinely-gone one (#5497).
+ */
+function isTransientStatus(status: number): boolean {
+	return status >= 500 || status === 429;
+}
+
 function toSession(data: GKProviderToken): CloudIntegrationAuthenticationSession {
 	// Normalize the backend's `tokenId` onto our `id` so callers get a stable per-connection identity.
 	return {
@@ -102,6 +112,19 @@ export class CloudIntegrationService {
 		return connections;
 	}
 
+	/**
+	 * Fetches a connection's token from the cloud, refreshing it first when `refreshToken` is given. Pass a
+	 * `connectionId` to target a specific connection (multi-account); omitting it operates on the provider's
+	 * primary.
+	 *
+	 * Resolves `undefined` only on a TERMINAL failure — the backend answered definitively that this
+	 * connection has no fetchable token (a terminal status, or an ok response with no `data`) — so callers may
+	 * treat that as "the connection is gone" and disconnect it (#5497).
+	 *
+	 * THROWS on a transient/retryable failure (see {@link isTransientStatus}) and on an unreachable backend,
+	 * neither of which is evidence the connection is gone. Callers that act on an empty result must catch and
+	 * preserve the connection so it self-heals on the next successful sync (#5569).
+	 */
 	async getConnectionSession(
 		id: IntegrationIds,
 		refreshToken?: string,
@@ -159,6 +182,21 @@ export class CloudIntegrationService {
 					const data = ((await newTokenRsp.json()) as { data?: GKProviderToken })?.data;
 					return data != null ? toSession(data) : undefined;
 				}
+
+				// The fallback GET failed too — surface a transient failure so the caller retries rather than
+				// dropping the connection (#5569); fall through to a terminal (undefined) result otherwise.
+				if (isTransientStatus(newTokenRsp.status)) {
+					throw new Error(`Transient failure (${newTokenRsp.status}) refreshing ${id} token from cloud`);
+				}
+
+				return undefined;
+			}
+
+			// Surface the failure KIND: a transient/retryable backend error (5xx/429) throws so callers keep
+			// the connection and self-heal on the next successful sync (#5569), while a terminal error (4xx —
+			// the connection/token is gone) returns undefined so it can be cleanly disconnected (#5497).
+			if (isTransientStatus(tokenRsp.status)) {
+				throw new Error(`Transient failure (${tokenRsp.status}) getting ${id} token from cloud`);
 			}
 
 			return undefined;
